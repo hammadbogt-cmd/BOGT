@@ -94,7 +94,7 @@ export async function syncWorkbook(connectionId: string, client: PrismaClient = 
   for (const tab of connection.tabs) {
     try {
       const values = await fetchTabValues(connection.spreadsheetId, tab.tabName);
-      const sheetData = fromValuesMatrix(values);
+      const sheetData = fromValuesMatrix(values, tab.headerRow);
       const schema = schemaForTargetEntity(tab.targetEntity as TargetEntity);
       const resolved = resolveColumnMap(sheetData.headers, schema);
 
