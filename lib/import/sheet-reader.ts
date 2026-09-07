@@ -40,11 +40,19 @@ export function listXlsxSheetNames(buffer: Buffer): string[] {
   return workbook.SheetNames;
 }
 
-/** Rows straight from the Google Sheets API `values.get` (array-of-arrays, first row = headers). */
-export function fromValuesMatrix(matrix: unknown[][]): SheetData {
-  if (matrix.length === 0) return { headers: [], rows: [] };
-  const headers = (matrix[0] as string[]).map((h) => String(h ?? "").trim());
-  const rows = matrix.slice(1).map((row) => {
+/**
+ * Rows straight from the Google Sheets API `values.get` (array-of-arrays).
+ *
+ * `headerRow` is 1-based and matches `SheetTabMapping.headerRow` (default 1,
+ * i.e. the first row of the tab). Some source tabs put a summary/stats row
+ * above the real column headers (e.g. a workbook-totals row), so the header
+ * row is configurable per tab rather than always assumed to be row 1.
+ */
+export function fromValuesMatrix(matrix: unknown[][], headerRow: number = 1): SheetData {
+  const startIndex = Math.max(0, headerRow - 1);
+  if (matrix.length <= startIndex) return { headers: [], rows: [] };
+  const headers = (matrix[startIndex] as string[]).map((h) => String(h ?? "").trim());
+  const rows = matrix.slice(startIndex + 1).map((row) => {
     const obj: Record<string, unknown> = {};
     headers.forEach((h, i) => {
       if (h) obj[h] = row[i] ?? null;
