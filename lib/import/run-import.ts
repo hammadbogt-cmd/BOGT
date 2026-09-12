@@ -1,13 +1,13 @@
 import type { PrismaClient } from "@prisma/client";
 import { prisma as defaultPrisma } from "../prisma";
-import { SheetData, readCsv, readXlsx } from "./sheet-reader";
-import { resolveColumnMap } from "./header-mapping";
+import { SheetData, readCsvMatrix, readXlsxMatrix, fromValuesMatrix } from "./sheet-reader";
+import { resolveColumnMap, detectHeaderRow } from "./header-mapping";
 import { ALL_SCHEMAS, TargetEntity, schemaForTargetEntity } from "./tab-schemas";
 import { importProductStats, ImportCounters } from "./importers/product-stats-importer";
 import { importRoverMasterStock } from "./importers/rover-master-importer";
 import { importStockIn } from "./importers/stock-in-importer";
 import { importStockOut } from "./importers/stock-out-importer";
-import { recomputeAllProducts } from "../engine/recompute";
+import { recomputeAllProducts, recomputeProducts } from "../engine/recompute";
 
 export interface RunImportParams {
   targetEntity: TargetEntity;
@@ -16,6 +16,8 @@ export interface RunImportParams {
   buffer?: Buffer; // for CSV/XLSX
   xlsxSheetName?: string;
   sheetData?: SheetData; // pre-built, e.g. from Google Sheets API values.get
+  /** Which row of the source held the headers, when sheetData was built by the caller. */
+  headerRow?: number;
   triggeredById?: string | null;
   recomputeAfter?: boolean; // default true
 }
@@ -24,7 +26,13 @@ export interface RunImportResult {
   importJobId: string;
   status: "SUCCEEDED" | "FAILED" | "PARTIAL";
   counters: ImportCounters & { newStockInTxns?: number; newStockOutTxns?: number };
-  mappingIssue: { missingRequired: string[] } | null;
+  mappingIssue: { missingRequired: string[]; headersSeen: string[]; headerRow: number } | null;
+  /** Which row of the source turned out to hold the column headers. */
+  headerRow?: number;
+  /** Logical field -> source column, as actually resolved for this run. */
+  columnMap?: Record<string, string>;
+  /** Source columns present but not used by this tab's mapping. */
+  unmatchedHeaders?: string[];
 }
 
 /**
@@ -48,9 +56,20 @@ export async function runImport(params: RunImportParams, client: PrismaClient = 
   });
 
   try {
-    const sheet =
-      params.sheetData ??
-      (params.sourceType === "CSV" ? readCsv(params.buffer!) : readXlsx(params.buffer!, params.xlsxSheetName ?? schema.tabName));
+    // Uploaded files are read as a raw grid so the real header row can be
+    // located (some tabs open with a totals/date row above the headers).
+    let sheet: SheetData;
+    let headerRow = 1;
+    if (params.sheetData) {
+      sheet = params.sheetData;
+      headerRow = params.headerRow ?? 1;
+    } else {
+      const matrix =
+        params.sourceType === "CSV" ? readCsvMatrix(params.buffer!) : readXlsxMatrix(params.buffer!, params.xlsxSheetName ?? schema.tabName);
+      const detection = detectHeaderRow(matrix, schema);
+      headerRow = detection.headerRow;
+      sheet = fromValuesMatrix(matrix, headerRow);
+    }
 
     const resolved = resolveColumnMap(sheet.headers, schema);
 
@@ -61,7 +80,7 @@ export async function runImport(params: RunImportParams, client: PrismaClient = 
           status: "FAILED",
           finishedAt: new Date(),
           mappingErrors: resolved.missingRequired.length,
-          summary: { missingRequired: resolved.missingRequired, headersSeen: sheet.headers },
+          summary: { missingRequired: resolved.missingRequired, headersSeen: sheet.headers, headerRow },
         },
       });
       await client.alert.create({
@@ -76,7 +95,10 @@ export async function runImport(params: RunImportParams, client: PrismaClient = 
         importJobId: job.id,
         status: "FAILED",
         counters: emptyCounters(),
-        mappingIssue: { missingRequired: resolved.missingRequired },
+        mappingIssue: { missingRequired: resolved.missingRequired, headersSeen: sheet.headers.filter((h) => h !== ""), headerRow },
+        headerRow,
+        columnMap: resolved.map,
+        unmatchedHeaders: resolved.unmatchedHeaders,
       };
     }
 
@@ -97,14 +119,6 @@ export async function runImport(params: RunImportParams, client: PrismaClient = 
         break;
       case "STOCK_OUT":
         counters = await importStockOut(client, sheet, resolved.map, job.id);
-        break;
-      case "TOTAL_LISTING_STATUS":
-        // Validation-only tab: captured for cross-check, never used as a primary source (spec section 30/31).
-        counters = { ...emptyCounters(), rowsRead: sheet.rows.length };
-        await client.importJob.update({
-          where: { id: job.id },
-          data: { summary: JSON.parse(JSON.stringify({ validationRows: sheet.rows })) },
-        });
         break;
       default:
         throw new Error(`Unsupported target entity ${params.targetEntity}`);
@@ -129,15 +143,31 @@ export async function runImport(params: RunImportParams, client: PrismaClient = 
         priceChanges: counters.priceChanges,
         stockChanges: counters.stockChanges,
         unmatchedProducts: counters.unmatchedProducts,
-        summary: { rowErrors: counters.rowErrors.slice(0, 200) },
+        summary: {
+          rowErrors: counters.rowErrors.slice(0, 200),
+          headerRow,
+          columnMap: resolved.map,
+          unmatchedHeaders: resolved.unmatchedHeaders ?? [],
+        },
       },
     });
 
     if (params.recomputeAfter !== false) {
-      await recomputeAllProducts(client);
+      // Only the products this import actually touched need recomputing.
+      const touched = counters.touchedProductIds;
+      if (touched && touched.length > 0) await recomputeProducts(touched, client);
+      else if (!touched) await recomputeAllProducts(client);
     }
 
-    return { importJobId: job.id, status, counters, mappingIssue: null };
+    return {
+      importJobId: job.id,
+      status,
+      counters,
+      mappingIssue: null,
+      headerRow,
+      columnMap: resolved.map,
+      unmatchedHeaders: resolved.unmatchedHeaders,
+    };
   } catch (err) {
     await client.importJob.update({
       where: { id: job.id },

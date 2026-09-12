@@ -2,22 +2,23 @@
  * Canonical header definitions for every source tab this system understands.
  *
  * This is the single place that knows what a column is CALLED in the
- * spreadsheets. Everything downstream (CSV/XLSX import today, Google Sheets
- * sync later) works off HEADER NAMES resolved here, never fixed column
- * letters/indices — so if a source sheet inserts or reorders a column, the
- * import still works as long as the header text is recognized (spec section
- * 29/47: "if a source column moves, mapping should still work if header is
- * unchanged").
+ * spreadsheets. Everything downstream (CSV/XLSX import, Google Sheets sync)
+ * works off HEADER NAMES resolved here, never fixed column letters/indices —
+ * so if a source column moves, the import still works as long as the header
+ * text is recognized (spec section 29/47: "if a source column moves, mapping
+ * should still work if header is unchanged").
  *
- * Each logical field lists every header spelling we'll accept (case/space
- * insensitive), so small variations across the two workbooks ("Cost" vs
- * "Cost Price", "VAT Cost" vs "Cost Price with VAT") still resolve.
+ * Each logical field lists every header spelling we'll accept. Matching
+ * ignores case, punctuation and hyphen/underscore/space differences, so
+ * "Our-price", "OUR PRICE" and "Our Price" are all the same column — but the
+ * WORDS have to match, which is why the real spellings from the live
+ * workbooks ("REFF FEE", "featuredoffer-price", "LAST MO. SALES", "Inovice
+ * ID", "Shelve Location") are all listed explicitly.
  */
 
 export type TargetEntity =
   | "ALL_PRODUCTS_STATS"
   | "OA_USA_PRODUCTS"
-  | "TOTAL_LISTING_STATUS"
   | "ROVER_MASTER_STOCK"
   | "STOCK_IN"
   | "STOCK_OUT";
@@ -41,38 +42,50 @@ function f(field: string, required: boolean, ...headerAliases: string[]): FieldS
   return { field, required, headerAliases };
 }
 
+/**
+ * The two Amazon tabs carry the same column set with slightly different
+ * spellings between them, so both spellings are accepted on both tabs.
+ */
+function amazonStatsFields(): FieldSpec[] {
+  return [
+    f("brand", false, "Brand Name", "Brand"),
+    f("listingStatus", false, "Listing Status"),
+    f("picLink", false, "Pic Link", "Products Pic"),
+    f("amzLink", false, "AMZ Link", "Amazon Link"),
+    f("barcode", false, "BOGT BAR CODE", "BOGT Barcode", "Barcode"),
+    f("title", true, "Product Name", "Title", "Product Title"),
+    f("lastMonthSale", false, "Last Month sale", "Last Month Sale", "LAST MO. SALES", "Last Mo Sales"),
+    f("bsr", false, "BSR"),
+    f("inboundQty", false, "inbound QTY", "Inbound QTY", "Inbound Qty", "Inbound Quantity"),
+    f("reservedQty", false, "Reserved Quantity", "Reserved QTY", "Reserved Qty"),
+    f("unfulfillableQty", false, "unfulfillable-quantity", "Unfulfillable-QTY", "Unfulfillable Quantity", "Unfulfillable Qty"),
+    f("asin", false, "ASIN"),
+    f("unitsShippedT30", false, "units-shipped-t30", "Units-Shipped-t30", "Units Shipped T30", "units shipped 30"),
+    f("availableQty", false, "Available QTY", "available qty", "Available Qty", "Amazon Inventory"),
+    f("availableQtyValue", false, "Available QTY Value", "Available Qty Value", "Value"),
+    f("sku", false, "SKU"),
+    f("costPrice", false, "Cost Price", "Cost"),
+    f("costPriceVat", false, "Cost Price with VAT", "Cost Price With VAT", "VAT Cost"),
+    f("fbaFee", false, "FBA FEE", "FBA Fee"),
+    f("referralFee", false, "REFF FEE", "Reff Fee", "Referral Fee", "REF FEE"),
+    f("breakevenPrice", false, "Breakeven Price", "Breakeven"),
+    f("buyBoxPrice", false, "featuredoffer-price", "Featuredoffer Price", "Featured Offer Price", "Featured Offer", "Buy Box Price"),
+    f("profitLoss", false, "PROFIT & LOSS", "Profit & Loss", "Profit and Loss", "Profit"),
+    f("profitPct", false, "PROFIT%", "Profit %", "Profit Percent"),
+    f("roi", false, "ROI"),
+    f("miniPrice", false, "Mini Price", "Minimum Price", "Min Price"),
+    f("ourPrice", false, "Our-price", "Our Price"),
+    f("shipmentDateForMonth", false, "Shipment Date for Month"),
+    f("lastShipmentQty", false, "Last Shipment Qty"),
+  ];
+}
+
 export const ALL_PRODUCTS_STATS_SCHEMA: TabSchema = {
   targetEntity: "ALL_PRODUCTS_STATS",
   workbookName: "2026 BOGT AMZ Stock & Prices",
   tabName: "All PRODUCTS STATS",
   identityFields: ["barcode", "asin", "sku"],
-  fields: [
-    f("brand", false, "Brand Name", "Brand"),
-    f("listingStatus", false, "Listing Status"),
-    f("barcode", false, "BOGT BAR CODE", "Barcode", "BOGT Barcode"),
-    f("title", true, "Product Name", "Title"),
-    f("lastMonthSale", false, "Last Month Sale"),
-    f("bsr", false, "BSR"),
-    f("inboundQty", false, "Inbound QTY", "Inbound Qty"),
-    f("reservedQty", false, "Reserved Quantity", "Reserved Qty"),
-    f("unfulfillableQty", false, "Unfulfillable Quantity", "Unfulfillable Qty"),
-    f("asin", false, "ASIN"),
-    f("unitsShippedT30", false, "Units Shipped T30"),
-    f("availableQty", false, "Available QTY", "Available Qty"),
-    f("availableQtyValue", false, "Available QTY Value", "Available Qty Value"),
-    f("sku", false, "SKU"),
-    f("costPrice", false, "Cost Price"),
-    f("costPriceVat", false, "Cost Price with VAT"),
-    f("fbaFee", false, "FBA Fee"),
-    f("referralFee", false, "Referral Fee"),
-    f("breakevenPrice", false, "Breakeven Price"),
-    f("buyBoxPrice", false, "Featured Offer Price / Buy Box Price", "Buy Box Price", "Featured Offer Price"),
-    f("profitLoss", false, "Profit & Loss", "Profit and Loss"),
-    f("profitPct", false, "Profit %"),
-    f("roi", false, "ROI"),
-    f("miniPrice", false, "Mini Price"),
-    f("ourPrice", false, "Our Price"),
-  ],
+  fields: amazonStatsFields(),
 };
 
 export const OA_USA_PRODUCTS_SCHEMA: TabSchema = {
@@ -80,40 +93,7 @@ export const OA_USA_PRODUCTS_SCHEMA: TabSchema = {
   workbookName: "2026 BOGT AMZ Stock & Prices",
   tabName: "OA USA Products",
   identityFields: ["barcode", "asin", "sku"],
-  fields: [
-    f("brand", false, "Brand"),
-    f("barcode", false, "Barcode"),
-    f("title", true, "Product Name", "Title"),
-    f("bsr", false, "BSR"),
-    f("availableQty", false, "Amazon Inventory"),
-    f("asin", false, "ASIN"),
-    f("unitsShippedT30", false, "Units Shipped T30"),
-    f("sku", false, "SKU"),
-    f("costPrice", false, "Cost"),
-    f("costPriceVat", false, "VAT Cost"),
-    f("fbaFee", false, "FBA Fee"),
-    f("referralFee", false, "Referral Fee"),
-    f("breakevenPrice", false, "Breakeven"),
-    f("buyBoxPrice", false, "Featured Offer"),
-    f("profitLoss", false, "Profit"),
-    f("roi", false, "ROI"),
-    f("miniPrice", false, "Minimum Price"),
-    f("ourPrice", false, "Our Price"),
-  ],
-};
-
-export const TOTAL_LISTING_STATUS_SCHEMA: TabSchema = {
-  targetEntity: "TOTAL_LISTING_STATUS",
-  workbookName: "2026 BOGT AMZ Stock & Prices",
-  tabName: "Total Listng Status",
-  identityFields: [],
-  fields: [
-    f("metric", false, "Metric", "Label"),
-    f("totalSku", false, "Total SKU"),
-    f("totalSkuQty", false, "Total SKU QTY"),
-    f("totalValue", false, "Total Value"),
-    f("last30DaysUnitSales", false, "Last 30 Days Unit Sales"),
-  ],
+  fields: amazonStatsFields(),
 };
 
 export const ROVER_MASTER_STOCK_SCHEMA: TabSchema = {
@@ -125,28 +105,29 @@ export const ROVER_MASTER_STOCK_SCHEMA: TabSchema = {
     f("asin", false, "ASIN"),
     f("sku", false, "SKU"),
     f("remarks", false, "Remarks"),
-    f("barcode", false, "BOGT Barcode", "Barcode"),
-    f("brand", false, "Brand"),
-    f("title", true, "Title", "Product Title"),
+    f("barcode", false, "BOGT Barcode", "BOGT BAR CODE", "Barcode"),
+    f("brand", false, "A Brand", "Brand", "Brand Name"),
+    f("title", true, "Title", "Product Title", "Product Name"),
     f("openingStock", false, "Opening Stock"),
     f("costPrice", false, "Cost Price"),
-    f("costPriceVat", false, "Cost Price with 5% VAT", "Cost Price with VAT"),
-    f("totalIn", false, "Total IN"),
-    f("totalOut", false, "Total OUT"),
-    f("currentStockRover", false, "Current Stock in Rover"),
-    f("currentStockOffice", false, "Current Stock in Office"),
+    f("costPriceVat", false, "Cost Price With VAT", "Cost Price with VAT", "Cost Price with 5% VAT"),
+    f("totalIn", false, "Total IN", "Total In"),
+    f("totalOut", false, "Total OUT", "Total Out"),
+    f("currentStockRover", false, "Current Stock IN Rover", "Current Stock in Rover"),
+    f("currentStockOffice", false, "Current Stock IN Office", "Current Stock in Office"),
     f("inventoryValue", false, "Inventory Value"),
-    f("qtyPerBox", false, "Qty per Box"),
-    f("totalBoxes", false, "Total Boxes"),
-    f("looseOpenBox", false, "Loose/Open Box"),
-    f("shelfLocation", false, "Shelf Location"),
-    f("stockStatus", false, "Stock Status"),
-    f("duplicateBarcodeCheck", false, "Duplicate Barcode Check"),
+    f("qtyPerBox", false, "QTY pr BOX", "Qty per Box", "QTY per BOX"),
+    f("totalBoxes", false, "Total Boxs", "Total Boxes"),
+    f("looseOpenBox", false, "Loose Open Box", "Loose/Open Box"),
+    f("shelfLocation", false, "Shelve Location", "Shelf Location"),
+    f("stockStatus", false, "Status", "Stock Status"),
+    f("duplicateBarcodeCheck", false, "Check", "Duplicate Barcode Check"),
     f("priceUpdateCheck", false, "Price Update Check"),
-    f("previousDatedStock", false, "Previous/Dated Stock"),
-    f("requiredQty", false, "Required Qty"),
-    f("fbaRequiredQty", false, "FBA Required Qty"),
-    f("otherPlatformRequiredQty", false, "Other Platform Required Qty"),
+    f("brandViewHelper", false, "BrandViewHelper"),
+    f("requiredQty", false, "Required QTY", "Required Qty"),
+    f("fbaRequiredQty", false, "FBA Required QTY", "FBA Required Qty"),
+    f("otherPlatformRequiredQty", false, "Quantity for other Plateform", "Quantity for other Platform", "Other Platform Required Qty"),
+    f("price", false, "Price"),
   ],
 };
 
@@ -157,13 +138,18 @@ export const STOCK_IN_SCHEMA: TabSchema = {
   identityFields: ["barcode"],
   fields: [
     f("date", true, "Date"),
-    f("invoiceId", false, "Invoice ID", "Invoice Id", "Invoice No"),
-    f("barcode", true, "Barcode"),
+    f("invoiceId", false, "Inovice ID", "Invoice ID", "Invoice Id", "Invoice No"),
+    f("barcode", true, "Barcode", "BOGT Barcode"),
     f("qtyIn", true, "Qty IN", "Qty In"),
+    f("currentStock", false, "Current Stock"),
     f("newCostPrice", false, "New Cost Price"),
-    f("oldCostPrice", false, "Old Cost Price"),
+    f("oldCostPrice", false, "OLD Cost Price", "Old Cost Price"),
     f("brand", false, "Brand"),
-    f("productTitle", false, "Product Title", "Title"),
+    f("productTitle", false, "Title", "Product Title"),
+    f("status", false, "Status"),
+    f("note", false, "Note", "Notes"),
+    f("priceCheck", false, "Price Check"),
+    f("asin", false, "ASIN"),
     f("supplierName", false, "Supplier", "Supplier Name"),
   ],
 };
@@ -175,20 +161,21 @@ export const STOCK_OUT_SCHEMA: TabSchema = {
   identityFields: ["barcode"],
   fields: [
     f("date", true, "Date"),
-    f("barcode", true, "Barcode"),
+    f("barcode", true, "Barcode", "BOGT Barcode"),
     f("qtyOut", true, "Qty OUT", "Qty Out"),
     f("currentStock", false, "Current Stock"),
-    f("shipmentReference", false, "Shipment Reference"),
+    f("shipmentReference", false, "Shipment Ref", "Shipment Reference"),
     f("brand", false, "Brand"),
-    f("productTitle", false, "Product Title", "Title"),
+    f("productTitle", false, "Title", "Product Title"),
     f("fcDestination", false, "FC Destination"),
+    f("status", false, "Status"),
+    f("note", false, "Note", "Notes"),
   ],
 };
 
 export const ALL_SCHEMAS: TabSchema[] = [
   ALL_PRODUCTS_STATS_SCHEMA,
   OA_USA_PRODUCTS_SCHEMA,
-  TOTAL_LISTING_STATUS_SCHEMA,
   ROVER_MASTER_STOCK_SCHEMA,
   STOCK_IN_SCHEMA,
   STOCK_OUT_SCHEMA,

@@ -2,8 +2,21 @@
 
 import { useActionState } from "react";
 import { syncAllAction, type SyncActionState } from "../app/actions/sync-actions";
+import type { SyncSummary } from "../lib/sheets/sync";
 
 const initialState: SyncActionState = {};
+
+/** A one-line outcome, with the first real problem named rather than just a status word. */
+function describeRun(results: SyncSummary[]): string {
+  if (results.every((r) => r.status === "CONNECTION_REQUIRED")) return "Connection required — see Import & Sync";
+
+  const rows = results.reduce((sum, r) => sum + r.productsChecked, 0);
+  const seconds = (results.reduce((sum, r) => sum + r.durationMs, 0) / 1000).toFixed(1);
+  const problems = results.flatMap((r) => r.errors);
+
+  if (problems.length === 0) return `Synced ${rows.toLocaleString()} rows in ${seconds}s`;
+  return `Synced ${rows.toLocaleString()} rows in ${seconds}s · ${problems.length} issue${problems.length === 1 ? "" : "s"} — see Import & Sync`;
+}
 
 /** The single primary "SYNC ALL LATEST DATA" button (spec section 48). */
 export function SyncButton() {
@@ -20,14 +33,8 @@ export function SyncButton() {
           {isPending ? "Syncing..." : "Sync All Latest Data"}
         </button>
       </form>
-      {state.error && <span className="text-xs text-red-600">{state.error}</span>}
-      {state.results && (
-        <span className="text-xs text-slate-500">
-          {state.results.every((r) => r.status === "CONNECTION_REQUIRED")
-            ? "Connection required — see Import & Sync"
-            : `Last run: ${state.results.map((r) => r.status).join(", ")}`}
-        </span>
-      )}
+      {state.error && <span className="max-w-md text-right text-xs text-red-600">{state.error}</span>}
+      {state.results && <span className="max-w-md text-right text-xs text-slate-500">{describeRun(state.results)}</span>}
     </div>
   );
 }

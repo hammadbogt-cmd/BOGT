@@ -15,6 +15,7 @@ export const NAV_SECTIONS: NavSection[] = [
     label: "Inventory",
     items: [
       { label: "Amazon Inventory", href: "/inventory/amazon" },
+      { label: "Listing Status", href: "/listing-status" },
       { label: "Warehouse Inventory", href: "/inventory/warehouse" },
       { label: "Stock Movements", href: "/stock-movements" },
     ],

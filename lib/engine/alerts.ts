@@ -2,6 +2,7 @@ import type { PrismaClient } from "@prisma/client";
 import { prisma as defaultPrisma } from "../prisma";
 import type { BusinessSettings } from "../calc/settings";
 import type { StockStatus } from "../calc/reorder";
+import { bulkUpdateById } from "../import/bulk";
 
 export type AlertSeverityInput = "INFO" | "WARNING" | "CRITICAL";
 
@@ -53,54 +54,82 @@ const STATE_ALERT_TYPES = [
   "OVERSTOCK",
 ] as const;
 
-async function syncProductAlerts(client: PrismaClient, productId: string, conditions: AlertCondition[]) {
-  const existingAlerts = await client.alert.findMany({
-    where: { productId, type: { in: STATE_ALERT_TYPES as unknown as never[] }, status: { in: ["OPEN", "ACKNOWLEDGED"] } },
-  });
-  const existingByType = new Map(existingAlerts.map((a) => [a.type as string, a]));
+/**
+ * Diffs freshly-computed conditions against what's already open, for MANY
+ * products at once: one read for the whole batch, then one batched write per
+ * kind of change. Recomputing thousands of products otherwise means
+ * thousands of sequential round trips, which is what makes a full sync
+ * outlive its request budget.
+ */
+async function syncAlertsBulk(client: PrismaClient, entries: { productId: string; conditions: AlertCondition[] }[]) {
+  if (entries.length === 0) return;
+  const productIds = entries.map((e) => e.productId);
 
-  const creates: AlertCondition[] = [];
+  const existingAlerts = await client.alert.findMany({
+    where: {
+      productId: { in: productIds },
+      type: { in: STATE_ALERT_TYPES as unknown as never[] },
+      status: { in: ["OPEN", "ACKNOWLEDGED"] },
+    },
+    select: { id: true, productId: true, type: true, severity: true, message: true },
+  });
+  const existingByKey = new Map(existingAlerts.map((a) => [`${a.productId} ${a.type as string}`, a]));
+
+  const creates: { productId: string; condition: AlertCondition }[] = [];
   const updates: { id: string; severity: AlertSeverityInput; message: string; metadata?: Record<string, unknown> }[] = [];
   const resolves: string[] = [];
 
-  for (const condition of conditions) {
-    const existing = existingByType.get(condition.type);
-    if (condition.active) {
-      if (!existing) {
-        creates.push(condition);
-      } else if (existing.severity !== condition.severity || existing.message !== condition.message) {
-        updates.push({ id: existing.id, severity: condition.severity, message: condition.message, metadata: condition.metadata });
+  for (const entry of entries) {
+    for (const condition of entry.conditions) {
+      const existing = existingByKey.get(`${entry.productId} ${condition.type}`);
+      if (condition.active) {
+        if (!existing) {
+          creates.push({ productId: entry.productId, condition });
+        } else if (existing.severity !== condition.severity || existing.message !== condition.message) {
+          updates.push({ id: existing.id, severity: condition.severity, message: condition.message, metadata: condition.metadata });
+        }
+      } else if (existing) {
+        resolves.push(existing.id);
       }
-    } else if (existing) {
-      resolves.push(existing.id);
     }
   }
 
-  if (creates.length === 0 && updates.length === 0 && resolves.length === 0) return;
-
-  const ops = [
-    ...creates.map((c) =>
-      client.alert.create({
-        data: {
+  if (creates.length > 0) {
+    for (let i = 0; i < creates.length; i += 500) {
+      await client.alert.createMany({
+        data: creates.slice(i, i + 500).map(({ productId, condition }) => ({
           productId,
-          type: c.type as never,
-          severity: c.severity as never,
-          status: "OPEN",
-          message: c.message,
-          metadata: c.metadata ? JSON.parse(JSON.stringify(c.metadata)) : undefined,
-        },
-      })
-    ),
-    ...updates.map((u) =>
-      client.alert.update({
-        where: { id: u.id },
-        data: { severity: u.severity as never, message: u.message, metadata: u.metadata ? JSON.parse(JSON.stringify(u.metadata)) : undefined },
-      })
-    ),
-    ...(resolves.length > 0 ? [client.alert.updateMany({ where: { id: { in: resolves } }, data: { status: "RESOLVED" } })] : []),
-  ];
+          type: condition.type as never,
+          severity: condition.severity as never,
+          status: "OPEN" as never,
+          message: condition.message,
+          metadata: condition.metadata ? JSON.parse(JSON.stringify(condition.metadata)) : undefined,
+        })),
+      });
+    }
+  }
 
-  await client.$transaction(ops as never[]);
+  // Wording/severity changes are common after a stock or price move, so
+  // these are written as one statement per batch rather than one per alert.
+  await bulkUpdateById(
+    client,
+    "alerts",
+    [
+      { name: "severity", type: "text", cast: '"AlertSeverity"' },
+      { name: "message", type: "text" },
+      { name: "metadata", type: "text", cast: "jsonb" },
+    ],
+    updates.map((u) => ({
+      id: u.id,
+      severity: u.severity,
+      message: u.message,
+      metadata: u.metadata ? JSON.stringify(u.metadata) : null,
+    }))
+  );
+
+  for (let i = 0; i < resolves.length; i += 1000) {
+    await client.alert.updateMany({ where: { id: { in: resolves.slice(i, i + 1000) } }, data: { status: "RESOLVED" } });
+  }
 }
 
 export interface ProductAlertSnapshot {
@@ -128,8 +157,22 @@ export interface ProductAlertSnapshot {
 
 /** Re-evaluates every STATE-based alert type for one product's current snapshot. */
 export async function evaluateProductAlerts(snapshot: ProductAlertSnapshot, settings: BusinessSettings, client: PrismaClient = defaultPrisma) {
-  if (!snapshot.isActive) return; // don't alert on delisted/inactive products
+  await evaluateProductAlertsBulk([snapshot], settings, client);
+}
 
+/** The same evaluation for a whole batch of products, with batched reads and writes. */
+export async function evaluateProductAlertsBulk(
+  snapshots: ProductAlertSnapshot[],
+  settings: BusinessSettings,
+  client: PrismaClient = defaultPrisma
+) {
+  const entries = snapshots
+    .filter((s) => s.isActive) // don't alert on delisted/inactive products
+    .map((s) => ({ productId: s.productId, conditions: buildAlertConditions(s, settings) }));
+  await syncAlertsBulk(client, entries);
+}
+
+function buildAlertConditions(snapshot: ProductAlertSnapshot, settings: BusinessSettings): AlertCondition[] {
   const netAvailable = snapshot.amazonAvailableQty + snapshot.roverQty + snapshot.officeQty;
   const cheapestQualifyingOffer = snapshot.offers
     .filter((o) => !o.disqualified)
@@ -227,7 +270,7 @@ export async function evaluateProductAlerts(snapshot: ProductAlertSnapshot, sett
     },
   ];
 
-  await syncProductAlerts(client, snapshot.productId, conditions);
+  return conditions;
 }
 
 export async function runFullAlertScan(client: PrismaClient = defaultPrisma) {

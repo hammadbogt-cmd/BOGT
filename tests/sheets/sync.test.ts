@@ -14,7 +14,9 @@ describe("Google Sheets connection scaffolding (spec section 48)", () => {
     const b = connections.find((c) => c.workbookName === WORKBOOK_B);
     expect(a).toBeDefined();
     expect(b).toBeDefined();
-    expect(a!.tabs.map((t) => t.tabName).sort()).toEqual(["All PRODUCTS STATS", "OA USA Products", "Total Listng Status"].sort());
+    // "Total Listng Status" is deliberately NOT synced — those figures are
+    // calculated in the portal from the two Amazon tabs instead.
+    expect(a!.tabs.map((t) => t.tabName).sort()).toEqual(["All PRODUCTS STATS", "OA USA Products"].sort());
     expect(b!.tabs.map((t) => t.tabName).sort()).toEqual(
       ["BOGT IN Rover Master Stock", "Stock_IN", "Stock_OUT"].sort() // Dashboard tab is validation-only, not imported
     );

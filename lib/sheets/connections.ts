@@ -38,8 +38,18 @@ export async function ensureSheetConnectionsSeeded(client: PrismaClient = defaul
         update: {},
       });
     }
+
+    // "Total Listng Status" used to be synced as a tab. Its figures are now
+    // calculated in the portal from the two Amazon tabs (see
+    // lib/reports/listing-status-summary.ts), so the stale mapping is
+    // removed rather than left behind reporting errors forever.
+    await client.sheetTabMapping.deleteMany({
+      where: { sheetConnectionId: connection.id, tabName: { in: RETIRED_TABS } },
+    });
   }
 }
+
+const RETIRED_TABS = ["Total Listng Status", "Total Listing Status"];
 
 export async function getConnectionsOverview(client: PrismaClient = defaultPrisma) {
   await ensureSheetConnectionsSeeded(client);

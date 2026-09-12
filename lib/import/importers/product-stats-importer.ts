@@ -2,8 +2,9 @@ import type { PrismaClient } from "@prisma/client";
 import { SheetData } from "../sheet-reader";
 import { ResolvedColumnMap, extractRow } from "../header-mapping";
 import { parseIntOrNull, parseNumberOrNull, parseStringOrNull } from "../value-parsers";
-import { matchProduct, registerIdentifier } from "../../matching/match-product";
 import { normalizeAsin, normalizeBarcode, normalizeSku } from "../../matching/normalize";
+import { IdentityIndex, recordIdentifierConflicts } from "../../matching/identity-index";
+import { bulkUpdateById, bulkUpsert, newId, type BulkColumn } from "../bulk";
 
 export interface ImportCounters {
   rowsRead: number;
@@ -17,6 +18,8 @@ export interface ImportCounters {
   stockChanges: number;
   unmatchedProducts: number;
   rowErrors: { rowNumber: number; message: string }[];
+  /** Ids of every product this import touched, so only those need recomputing afterwards. */
+  touchedProductIds?: string[];
 }
 
 function emptyCounters(): ImportCounters {
@@ -32,8 +35,46 @@ function emptyCounters(): ImportCounters {
     stockChanges: 0,
     unmatchedProducts: 0,
     rowErrors: [],
+    touchedProductIds: [],
   };
 }
+
+interface ProductFields {
+  brand: string | null;
+  title: string;
+  bsr: number | null;
+  unitsShippedT30: number | null;
+  lastMonthSale: number | null;
+  amazonAvailableQty: number;
+  amazonReservedQty: number;
+  amazonInboundQty: number;
+  amazonUnfulfillableQty: number;
+  buyBoxPrice: number | null;
+  ourPrice: number | null;
+  miniPrice: number | null;
+  currentCost: number | null;
+  currentCostWithVat: number | null;
+  fbaFee: number | null;
+}
+
+const PRODUCT_UPDATE_COLUMNS: BulkColumn[] = [
+  { name: "brand", type: "text" },
+  { name: "title", type: "text" },
+  { name: "bsr", type: "integer" },
+  { name: "unitsShippedT30", type: "integer" },
+  { name: "lastMonthSale", type: "integer" },
+  { name: "amazonAvailableQty", type: "integer" },
+  { name: "amazonReservedQty", type: "integer" },
+  { name: "amazonInboundQty", type: "integer" },
+  { name: "amazonUnfulfillableQty", type: "integer" },
+  { name: "buyBoxPrice", type: "numeric" },
+  { name: "ourPrice", type: "numeric" },
+  { name: "miniPrice", type: "numeric" },
+  { name: "currentCost", type: "numeric" },
+  { name: "currentCostWithVat", type: "numeric" },
+  { name: "fbaFee", type: "numeric" },
+  { name: "updatedAt", type: "timestamp" },
+];
 
 /**
  * Shared importer for the two Amazon operational-stats tabs (spec sections
@@ -41,6 +82,15 @@ function emptyCounters(): ImportCounters {
  * (source = OA_USA). Both tabs enter the SAME Product Master, but their
  * catalog source, and the SKU "namespace" they belong to, are preserved
  * (spec: "Do not assume the same SKU format between these tabs").
+ *
+ * Runs as a BULK pass: identity and existing product state are read once up
+ * front, every row is resolved in memory, and the resulting inserts/updates
+ * are written in batched statements. Row-level behaviour (matching priority,
+ * skip rules, duplicate-barcode protection, counters) is identical to the
+ * previous row-at-a-time implementation — but a 1,600-row tab costs on the
+ * order of a dozen database round trips instead of ~20,000, which is the
+ * difference between a sync that finishes and one that is killed by the
+ * hosting time limit.
  */
 export async function importProductStats(
   client: PrismaClient,
@@ -51,6 +101,32 @@ export async function importProductStats(
 ): Promise<ImportCounters> {
   const counters = emptyCounters();
   const skuIdentifierType = catalogSource === "AMAZON_MAIN" ? "AMAZON_SKU" : "OA_SKU";
+  const now = new Date();
+
+  const index = await IdentityIndex.load(client);
+  const existingProducts = new Map(
+    (
+      await client.product.findMany({
+        select: {
+          id: true,
+          title: true,
+          brand: true,
+          buyBoxPrice: true,
+          ourPrice: true,
+          currentCost: true,
+          amazonAvailableQty: true,
+        },
+      })
+    ).map((p) => [p.id, p])
+  );
+
+  const productCreates: Record<string, unknown>[] = [];
+  const productUpdates: Record<string, unknown>[] = [];
+  const sourceMappings: Record<string, unknown>[] = [];
+  const statsRows: Record<string, unknown>[] = [];
+  const salesRows: Record<string, unknown>[] = [];
+  const matchingQueueRows: Record<string, unknown>[] = [];
+  const touched = new Set<string>();
 
   for (let i = 0; i < sheet.rows.length; i++) {
     const rowNumber = i + 2; // account for header row
@@ -62,6 +138,7 @@ export async function importProductStats(
       const asin = normalizeAsin(parseStringOrNull(raw.asin));
       const sku = normalizeSku(parseStringOrNull(raw.sku));
       const title = parseStringOrNull(raw.title);
+      const listingStatusText = parseStringOrNull(raw.listingStatus);
 
       if (!title) {
         counters.rowsSkipped++;
@@ -69,14 +146,14 @@ export async function importProductStats(
         continue;
       }
 
-      const match = await matchProduct(client, {
+      const match = index.match({
         barcode,
         asin,
         amazonSku: catalogSource === "AMAZON_MAIN" ? sku : null,
         oaSku: catalogSource === "OA_USA" ? sku : null,
       });
 
-      const fields = {
+      const fields: ProductFields = {
         brand: parseStringOrNull(raw.brand),
         title,
         bsr: parseIntOrNull(raw.bsr),
@@ -95,46 +172,50 @@ export async function importProductStats(
       };
 
       let productId = match.productId;
-      let isNewProduct = false;
 
       if (!productId) {
         if (!barcode && !asin && !sku) {
           // Nothing to key off at all — route to review instead of creating a ghost product.
           counters.unmatchedProducts++;
-          await client.matchingQueue.create({
-            data: {
-              candidateType: "sheet_import",
-              rawIdentifier: null,
-              rawTitle: title,
-              rawBrand: fields.brand,
-              confidence: "LOW",
-              metadata: { importJobId, rowNumber, reason: "NO_IDENTIFIER" },
-            },
+          matchingQueueRows.push({
+            candidateType: "sheet_import",
+            rawIdentifier: null,
+            rawTitle: title,
+            rawBrand: fields.brand,
+            confidence: "LOW",
+            metadata: { importJobId, rowNumber, reason: "NO_IDENTIFIER" },
           });
           counters.rowsSkipped++;
           continue;
         }
 
-        const created = await client.product.create({
-          data: {
-            ...fields,
-            catalogSource: catalogSource as never,
-            primaryBarcode: barcode ?? undefined,
-            asin: asin ?? undefined,
-            amazonSku: catalogSource === "AMAZON_MAIN" ? sku ?? undefined : undefined,
-            oaSku: catalogSource === "OA_USA" ? sku ?? undefined : undefined,
-          },
+        productId = newId();
+        productCreates.push({
+          id: productId,
+          ...fields,
+          catalogSource,
+          primaryBarcode: barcode,
+          asin,
+          amazonSku: catalogSource === "AMAZON_MAIN" ? sku : null,
+          oaSku: catalogSource === "OA_USA" ? sku : null,
+          createdAt: now,
+          updatedAt: now,
         });
-        productId = created.id;
-        isNewProduct = true;
+        // Keep in-memory state consistent for any later row that matches this same product.
+        existingProducts.set(productId, {
+          id: productId,
+          title: fields.title,
+          brand: fields.brand,
+          buyBoxPrice: fields.buyBoxPrice as never,
+          ourPrice: fields.ourPrice as never,
+          currentCost: fields.currentCost as never,
+          amazonAvailableQty: fields.amazonAvailableQty,
+        });
         counters.productsAdded++;
         counters.rowsCreated++;
-
-        if (barcode) await registerIdentifier(client, productId, "BARCODE_PRIMARY", barcode, "sheet_import");
-        if (asin) await registerIdentifier(client, productId, "ASIN", asin, "sheet_import");
-        if (sku) await registerIdentifier(client, productId, skuIdentifierType, sku, "sheet_import");
       } else {
-        const existing = await client.product.findUniqueOrThrow({ where: { id: productId } });
+        const existing = existingProducts.get(productId);
+        if (!existing) throw new Error(`Matched product ${productId} is missing from the product master`);
 
         const priceChanged =
           numChanged(existing.buyBoxPrice, fields.buyBoxPrice) ||
@@ -144,67 +225,83 @@ export async function importProductStats(
         if (priceChanged) counters.priceChanges++;
         if (stockChanged) counters.stockChanges++;
 
-        await client.product.update({
-          where: { id: productId },
-          data: {
-            ...fields,
-            // Never blank out a title/brand we already had with an empty value from a partial row.
-            title: title || existing.title,
-            brand: fields.brand ?? existing.brand,
-          },
+        productUpdates.push({
+          id: productId,
+          ...fields,
+          // Never blank out a title/brand we already had with an empty value from a partial row.
+          title: title || existing.title,
+          brand: fields.brand ?? existing.brand,
+          updatedAt: now,
+        });
+        existingProducts.set(productId, {
+          ...existing,
+          title: title || existing.title,
+          brand: fields.brand ?? existing.brand,
+          buyBoxPrice: fields.buyBoxPrice as never,
+          ourPrice: fields.ourPrice as never,
+          currentCost: fields.currentCost as never,
+          amazonAvailableQty: fields.amazonAvailableQty,
         });
         counters.productsUpdated++;
         counters.rowsUpdated++;
-
-        if (barcode) await registerIdentifier(client, productId, "BARCODE_PRIMARY", barcode, "sheet_import");
-        if (asin) await registerIdentifier(client, productId, "ASIN", asin, "sheet_import");
-        if (sku) await registerIdentifier(client, productId, skuIdentifierType, sku, "sheet_import");
       }
 
-      await client.productSourceMapping.upsert({
-        where: { source_sourceSku: { source: catalogSource as never, sourceSku: sku ?? `ROW_${rowNumber}` } },
-        create: { productId, source: catalogSource as never, sourceSku: sku ?? `ROW_${rowNumber}` },
-        update: { productId },
+      if (barcode) index.stage(productId, "BARCODE_PRIMARY", barcode, "sheet_import");
+      if (asin) index.stage(productId, "ASIN", asin, "sheet_import");
+      if (sku) index.stage(productId, skuIdentifierType, sku, "sheet_import");
+
+      touched.add(productId);
+
+      sourceMappings.push({
+        id: newId(),
+        productId,
+        source: catalogSource,
+        sourceSku: sku ?? `ROW_${rowNumber}`,
+        createdAt: now,
       });
 
-      await client.amazonStats.updateMany({ where: { productId, source: catalogSource as never, isCurrent: true }, data: { isCurrent: false } });
-      await client.amazonStats.create({
-        data: {
-          productId,
-          source: catalogSource as never,
-          isCurrent: true,
-          brandName: fields.brand,
-          bsr: fields.bsr,
-          lastMonthSale: fields.lastMonthSale,
-          unitsShippedT30: fields.unitsShippedT30,
-          inboundQty: fields.amazonInboundQty,
-          reservedQty: fields.amazonReservedQty,
-          unfulfillableQty: fields.amazonUnfulfillableQty,
-          availableQty: fields.amazonAvailableQty,
-          availableQtyValue: parseNumberOrNull(raw.availableQtyValue),
-          costPrice: fields.currentCost,
-          costPriceWithVat: fields.currentCostWithVat,
-          fbaFee: fields.fbaFee,
-          referralFee: parseNumberOrNull(raw.referralFee),
-          breakevenPrice: parseNumberOrNull(raw.breakevenPrice),
-          buyBoxPrice: fields.buyBoxPrice,
-          profitLoss: parseNumberOrNull(raw.profitLoss),
-          profitPct: parseNumberOrNull(raw.profitPct),
-          roi: parseNumberOrNull(raw.roi),
-          miniPrice: fields.miniPrice,
-          ourPrice: fields.ourPrice,
-          importJobId,
-        },
+      statsRows.push({
+        id: newId(),
+        productId,
+        source: catalogSource,
+        effectiveDate: now,
+        isCurrent: true,
+        brandName: fields.brand,
+        listingStatus: listingStatusText,
+        bsr: fields.bsr,
+        lastMonthSale: fields.lastMonthSale,
+        unitsShippedT30: fields.unitsShippedT30,
+        inboundQty: fields.amazonInboundQty,
+        reservedQty: fields.amazonReservedQty,
+        unfulfillableQty: fields.amazonUnfulfillableQty,
+        availableQty: fields.amazonAvailableQty,
+        availableQtyValue: parseNumberOrNull(raw.availableQtyValue),
+        costPrice: fields.currentCost,
+        costPriceWithVat: fields.currentCostWithVat,
+        fbaFee: fields.fbaFee,
+        referralFee: parseNumberOrNull(raw.referralFee),
+        breakevenPrice: parseNumberOrNull(raw.breakevenPrice),
+        buyBoxPrice: fields.buyBoxPrice,
+        profitLoss: parseNumberOrNull(raw.profitLoss),
+        profitPct: parseNumberOrNull(raw.profitPct),
+        roi: parseNumberOrNull(raw.roi),
+        miniPrice: fields.miniPrice,
+        ourPrice: fields.ourPrice,
+        importJobId,
+        createdAt: now,
       });
 
       if (fields.unitsShippedT30 != null) {
-        await client.salesHistory.create({
-          data: { productId, periodType: "T30", unitsSold: fields.unitsShippedT30, periodEnd: new Date(), source: catalogSource },
+        salesRows.push({
+          id: newId(),
+          productId,
+          periodType: "T30",
+          unitsSold: fields.unitsShippedT30,
+          periodEnd: now,
+          isEstimated: false,
+          source: catalogSource,
+          createdAt: now,
         });
-      }
-
-      if (!isNewProduct === false) {
-        // no-op branch kept for clarity; counters already incremented above
       }
     } catch (err) {
       counters.errorCount++;
@@ -212,7 +309,73 @@ export async function importProductStats(
     }
   }
 
+  // ---- write everything, in batches -------------------------------------
+  await flushProductCreates(client, productCreates);
+  await bulkUpdateById(client, "products", PRODUCT_UPDATE_COLUMNS, productUpdates);
+  await index.flush(client);
+  await recordIdentifierConflicts(client, index.takeConflicts());
+
+  await bulkUpsert(
+    client,
+    "product_source_mappings",
+    ["source", "sourceSku"],
+    [
+      { name: "id", type: "text" },
+      { name: "productId", type: "text" },
+      { name: "source", type: "text", cast: '"CatalogSource"' },
+      { name: "sourceSku", type: "text" },
+      { name: "createdAt", type: "timestamp" },
+    ],
+    dedupeBy(sourceMappings, (r) => `${r.source} ${r.sourceSku}`),
+    { updateColumns: ["productId"] }
+  );
+
+  const touchedIds = [...touched];
+  await supersedeCurrentStats(client, touchedIds, catalogSource);
+  await insertStats(client, statsRows);
+  await insertSales(client, salesRows);
+
+  if (matchingQueueRows.length > 0) {
+    await client.matchingQueue.createMany({ data: matchingQueueRows as never[] });
+  }
+
+  counters.touchedProductIds = touchedIds;
   return counters;
+}
+
+/** Later rows win, matching the previous per-row upsert behaviour. */
+function dedupeBy(rows: Record<string, unknown>[], key: (row: Record<string, unknown>) => string): Record<string, unknown>[] {
+  const map = new Map<string, Record<string, unknown>>();
+  for (const row of rows) map.set(key(row), row);
+  return [...map.values()];
+}
+
+async function flushProductCreates(client: PrismaClient, rows: Record<string, unknown>[]) {
+  for (let i = 0; i < rows.length; i += 500) {
+    await client.product.createMany({ data: rows.slice(i, i + 500) as never[] });
+  }
+}
+
+async function supersedeCurrentStats(client: PrismaClient, productIds: string[], catalogSource: string) {
+  for (let i = 0; i < productIds.length; i += 1000) {
+    const chunk = productIds.slice(i, i + 1000);
+    await client.amazonStats.updateMany({
+      where: { productId: { in: chunk }, source: catalogSource as never, isCurrent: true },
+      data: { isCurrent: false },
+    });
+  }
+}
+
+async function insertStats(client: PrismaClient, rows: Record<string, unknown>[]) {
+  for (let i = 0; i < rows.length; i += 500) {
+    await client.amazonStats.createMany({ data: rows.slice(i, i + 500) as never[] });
+  }
+}
+
+async function insertSales(client: PrismaClient, rows: Record<string, unknown>[]) {
+  for (let i = 0; i < rows.length; i += 1000) {
+    await client.salesHistory.createMany({ data: rows.slice(i, i + 1000) as never[] });
+  }
 }
 
 function numChanged(a: unknown, b: number | null): boolean {

@@ -35,6 +35,26 @@ export function readXlsx(buffer: Buffer, sheetName?: string): SheetData {
   return { headers, rows };
 }
 
+/**
+ * Reads an uploaded CSV as a raw grid (no header assumption), so the real
+ * header row can be located before the data is interpreted.
+ */
+export function readCsvMatrix(buffer: Buffer): unknown[][] {
+  const parsed = Papa.parse<string[]>(buffer.toString("utf-8"), { header: false, skipEmptyLines: false });
+  return (parsed.data as unknown[][]) ?? [];
+}
+
+/** Same as `readCsvMatrix`, for an uploaded workbook sheet. */
+export function readXlsxMatrix(buffer: Buffer, sheetName?: string): unknown[][] {
+  const workbook = XLSX.read(buffer, { type: "buffer", cellDates: true });
+  const name = sheetName && workbook.SheetNames.includes(sheetName) ? sheetName : workbook.SheetNames[0];
+  const sheet = workbook.Sheets[name];
+  if (!sheet) {
+    throw new Error(`Sheet "${sheetName}" not found. Available sheets: ${workbook.SheetNames.join(", ")}`);
+  }
+  return XLSX.utils.sheet_to_json<unknown[]>(sheet, { header: 1, defval: null, raw: true }) as unknown[][];
+}
+
 export function listXlsxSheetNames(buffer: Buffer): string[] {
   const workbook = XLSX.read(buffer, { type: "buffer", bookSheets: true });
   return workbook.SheetNames;

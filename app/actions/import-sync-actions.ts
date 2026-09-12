@@ -92,6 +92,47 @@ export async function setSpreadsheetIdAction(_prev: ConnectionConfigState, formD
   }
 }
 
+export interface TabConfigState {
+  success?: boolean;
+  error?: string;
+}
+
+/**
+ * Sets which row of a source tab actually holds the column headers (1-based).
+ * Some tabs (e.g. a workbook with a totals/summary row above the real
+ * header row) need this to be 2 or higher — without it the importer reads
+ * the summary row as headers and every required column looks "missing".
+ */
+export async function setHeaderRowAction(_prev: TabConfigState, formData: FormData): Promise<TabConfigState> {
+  try {
+    const user = await requirePermission("run_sheet_sync");
+    const tabId = String(formData.get("tabId"));
+    const headerRowRaw = Number(formData.get("headerRow"));
+    const headerRow = Number.isFinite(headerRowRaw) && headerRowRaw >= 1 ? Math.floor(headerRowRaw) : 1;
+
+    const tab = await prisma.sheetTabMapping.findUniqueOrThrow({ where: { id: tabId } });
+    await prisma.sheetTabMapping.update({
+      where: { id: tabId },
+      data: { headerRow, lastError: null },
+    });
+
+    await recordAudit({
+      userId: user.id,
+      action: "SET_SHEET_HEADER_ROW",
+      entityType: "SheetTabMapping",
+      entityId: tabId,
+      oldValue: { headerRow: tab.headerRow },
+      newValue: { headerRow },
+      source: "ui",
+    });
+
+    revalidatePath("/import-sync");
+    return { success: true };
+  } catch (err) {
+    return { error: err instanceof Error ? err.message : String(err) };
+  }
+}
+
 export interface AutoSyncState {
   success?: boolean;
   error?: string;
